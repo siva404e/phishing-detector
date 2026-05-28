@@ -5,30 +5,65 @@
 ╚══════════════════════════════════════════════════════════════╝
 
 Run:
-    pip install flask python-whois requests colorama
+    pip install flask python-whois requests colorama python-dotenv
     python dashboard.py
 Then open: http://127.0.0.1:5000
 """
 
 from flask import Flask, render_template_string, request, jsonify
 import re, ssl, socket, whois, requests as req
-import datetime, urllib.parse, sys, io, time
+import datetime, urllib.parse, sys, io, time, json, os
+
+# Import utilities
+from utils import URLValidator, RiskScorer, DomainAnalyzer, PatternDetector, StringMatcher, TimeFormatter
+from config import Config
 
 app = Flask(__name__)
 
-VIRUSTOTAL_API_KEY = ""
+# Load VirusTotal API Key from config
+VIRUSTOTAL_API_KEY = Config.VIRUSTOTAL_API_KEY
 
-scan_history = []  # stores last 10 scans
+# Scan history file
+SCAN_HISTORY_FILE = "scan_history.json"
+MAX_HISTORY_ENTRIES = 50
 
-SUSPICIOUS_KEYWORDS = [
-    "login","verify","update","secure","account","banking","confirm",
-    "password","signin","paypal","amazon","apple","microsoft","support",
-    "urgent","suspend","click","free","winner","prize","alert","limited",
-    "offer","ebay","netflix"
-]
-SUSPICIOUS_TLDS = [".tk",".ml",".ga",".cf",".gq",".xyz",".top",".click",".link"]
+# Initialize scan history from file or empty list
+scan_history = []
+
+def load_scan_history():
+    """Load scan history from JSON file"""
+    global scan_history
+    if os.path.exists(SCAN_HISTORY_FILE):
+        try:
+            with open(SCAN_HISTORY_FILE, 'r') as f:
+                scan_history = json.load(f)
+                # Keep only last MAX_HISTORY_ENTRIES
+                if len(scan_history) > MAX_HISTORY_ENTRIES:
+                    scan_history = scan_history[-MAX_HISTORY_ENTRIES:]
+        except Exception as e:
+            print(f"Error loading scan history: {e}")
+            scan_history = []
+    else:
+        scan_history = []
+
+def save_scan_history():
+    """Save scan history to JSON file"""
+    try:
+        # Keep only last MAX_HISTORY_ENTRIES
+        entries_to_save = scan_history[-MAX_HISTORY_ENTRIES:]
+        with open(SCAN_HISTORY_FILE, 'w') as f:
+            json.dump(entries_to_save, f, indent=2)
+    except Exception as e:
+        print(f"Error saving scan history: {e}")
+
+# Load history on startup
+load_scan_history()
+
+# Use config values for suspicious patterns
+SUSPICIOUS_KEYWORDS = Config.SUSPICIOUS_KEYWORDS
+SUSPICIOUS_TLDS = Config.SUSPICIOUS_TLDS
+HOMOGRAPH_CHARS = Config.HOMOGRAPH_CHARS
 IP_IN_URL_PATTERN = re.compile(r"(https?://)?(\d{1,3}\.){3}\d{1,3}")
-HOMOGRAPH_CHARS = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','і':'i'}
 
 # ── HTML TEMPLATE ─────────────────────────────────────────────
 HTML = """
@@ -629,14 +664,6 @@ HTML = """
 
 # ── HELPER FUNCTIONS ───────────────────────────────────────────
 
-def extract_domain(url):
-    try:
-        parsed = urllib.parse.urlparse(url)
-        domain = parsed.netloc or parsed.path
-        return domain.replace("www.", "").split("/")[0]
-    except:
-        return None
-
 def check_whois(domain):
     checks = []
     score  = 0
@@ -657,7 +684,8 @@ def check_whois(domain):
                 creation = creation.replace(tzinfo=None)
             age_days   = (datetime.datetime.now() - creation).days
             age_months = age_days // 30
-            domain_age = f"{age_months}mo ({age_days}d)"
+            domain_age_str, _ = DomainAnalyzer.get_domain_age_string(creation)
+            domain_age = domain_age_str
 
             if age_days < 30:
                 score += 50
@@ -741,7 +769,7 @@ def check_virustotal(url):
     checks = []
     score  = 0
     malicious = 0
-    if VIRUSTOTAL_API_KEY == "YOUR_VIRUSTOTAL_API_KEY_HERE":
+    if not VIRUSTOTAL_API_KEY or VIRUSTOTAL_API_KEY == "":
         checks.append({"type":"warn","text":"VirusTotal API key not set — skipped"})
         return 0, checks, 0
     try:
@@ -782,7 +810,7 @@ def check_url_structure(url, domain):
     score  = 0
     url_lower = url.lower()
 
-    if IP_IN_URL_PATTERN.match(url):
+    if PatternDetector.has_ip_address(url):
         score += 30; checks.append({"type":"danger","text":"IP address used instead of domain (+30)"})
     else:
         checks.append({"type":"ok","text":"Domain name used (not raw IP)"})
@@ -798,7 +826,7 @@ def check_url_structure(url, domain):
     else:
         checks.append({"type":"ok","text":f"URL length normal ({len(url)} chars)"})
 
-    found_kw = [kw for kw in SUSPICIOUS_KEYWORDS if kw in url_lower]
+    found_kw = StringMatcher.find_keywords(url_lower, SUSPICIOUS_KEYWORDS)
     if found_kw:
         score += min(len(found_kw)*5, 25)
         checks.append({"type":"warn","text":f"Suspicious keywords: {', '.join(found_kw[:5])}"})
@@ -810,9 +838,9 @@ def check_url_structure(url, domain):
     else:
         checks.append({"type":"ok","text":f"Subdomain count normal ({domain.count('.')})"})
 
-    for char in url:
-        if char in HOMOGRAPH_CHARS:
-            score += 30; checks.append({"type":"danger","text":"Homograph/Unicode spoofing detected (+30)"}); break
+    has_homograph, char, replacement = StringMatcher.check_homograph_chars(url, HOMOGRAPH_CHARS)
+    if has_homograph:
+        score += 30; checks.append({"type":"danger","text":"Homograph/Unicode spoofing detected (+30)"})
     else:
         checks.append({"type":"ok","text":"No homograph spoofing detected"})
 
@@ -827,13 +855,6 @@ def check_url_structure(url, domain):
 
     return score, checks
 
-def get_verdict(score):
-    if score >= 70: return "CRITICAL"
-    if score >= 45: return "HIGH"
-    if score >= 25: return "MODERATE"
-    if score >= 10: return "LOW"
-    return "SAFE"
-
 # ── ROUTES ────────────────────────────────────────────────────
 
 @app.route("/")
@@ -842,12 +863,14 @@ def index():
 
 @app.route("/scan", methods=["POST"])
 def scan():
+    global scan_history
+    
     data = request.get_json()
     url  = data.get("url","").strip()
     if not url.startswith("http"):
         url = "https://" + url
 
-    domain = extract_domain(url)
+    domain = URLValidator.extract_domain(url)
     if not domain:
         return jsonify({"error":"Invalid URL"}), 400
 
@@ -870,8 +893,8 @@ def scan():
     total += s4
     all_checks.append({"title":"URL STRUCTURE ANALYSIS", "items": c4})
 
-    level = get_verdict(total)
-    now   = datetime.datetime.now().strftime("%H:%M:%S")
+    level = RiskScorer.get_verdict(total)
+    now   = TimeFormatter.get_current_time()
 
     entry = {
         "url": url, "domain": domain,
@@ -880,8 +903,13 @@ def scan():
         "ssl_issuer": ssl_issuer, "vt_malicious": vt_malicious
     }
     scan_history.append(entry)
-    if len(scan_history) > 10:
-        scan_history.pop(0)
+    
+    # Keep only last 50 entries
+    if len(scan_history) > 50:
+        scan_history = scan_history[-50:]
+    
+    # Save to file
+    save_scan_history()
 
     return jsonify({
         **entry,
